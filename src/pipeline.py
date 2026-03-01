@@ -276,6 +276,17 @@ class TransactionRAGPipeline:
             for date, amt in monthly.items():
                 summary[f"month_{date.strftime('%Y_%m')}"] = round(float(amt), 2)
 
+        # Top merchants by spend (for hallucination verification on merchant queries)
+        if not expenses.empty and "merchant_name" in expenses.columns:
+            top_merchants = (
+                expenses.groupby("merchant_name")["transaction_amount"]
+                .sum()
+                .sort_values(ascending=False)
+                .head(10)
+            )
+            for merchant, amt in top_merchants.items():
+                summary[f"merchant_{merchant}"] = round(float(amt), 2)
+
         return summary
 
     def _fallback_response(self, user_df: pd.DataFrame, profile: dict, prompt: str) -> str:

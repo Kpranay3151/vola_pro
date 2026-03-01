@@ -71,9 +71,11 @@ TOXICITY_KEYWORDS = [
 # Hedging phrases indicating low confidence
 HEDGING_PHRASES = [
     "i'm not sure", "i am not sure", "i think", "might be", "could be",
-    "possibly", "perhaps", "it seems", "not certain", "unclear",
+    "it seems", "not certain", "unclear",
     "hard to say", "difficult to determine", "insufficient data",
     "not enough information", "cannot determine",
+    # "perhaps" and "possibly" removed — commonly used as polite suggestions
+    # ("or perhaps a trend?"), not genuine uncertainty — caused false positives.
 ]
 
 

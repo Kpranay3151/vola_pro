@@ -27,7 +27,7 @@ IMPORTANT RULES:
 
 You have access to visualization tools. Use them proactively when they add value to your response:
 - For spending trends → use plot_monthly_spending_trend
-- For category breakdowns → use plot_category_breakdown  
+- For category breakdowns → use plot_category_breakdown
 - For income vs expense analysis → use plot_income_vs_expense
 - For comprehensive financial reports → use multiple tools together
 """
@@ -109,6 +109,18 @@ def build_user_df_summary(user_df) -> str:
         )
         lines.append("Top expense categories: " + ", ".join(
             f"{cat} (${amt:,.2f})" for cat, amt in cats.items()
+        ))
+
+    # Top merchants by total spend
+    if not expenses.empty and "merchant_name" in expenses.columns:
+        top_merchants = (
+            expenses.groupby("merchant_name")["transaction_amount"]
+            .sum()
+            .sort_values(ascending=False)
+            .head(10)
+        )
+        lines.append("Top merchants by spend: " + ", ".join(
+            f"{m} (${amt:,.2f})" for m, amt in top_merchants.items()
         ))
 
     # Recent months

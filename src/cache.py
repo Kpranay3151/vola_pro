@@ -3,6 +3,7 @@
 Stores per-user profiles, query histories, and visualization state in memory.
 """
 
+import threading
 import pandas as pd
 from collections import deque
 from datetime import datetime
@@ -12,8 +13,8 @@ from src.utils import get_parent_category, format_currency
 
 
 class UserCacheManager:
-    """In-memory key-value cache scoped per user.
-    
+    """Thread-safe in-memory key-value cache scoped per user.
+
     Cache structure:
         user:{id}:profile      → dict with name, date_range, top_categories, avg_monthly_spend
         user:{id}:query_history → deque of (prompt, operation_desc, result_summary) tuples
@@ -24,6 +25,7 @@ class UserCacheManager:
 
     def __init__(self):
         self._store: Dict[str, Any] = {}
+        self._lock = threading.Lock()
 
     # ──────────────────────────────────────────────
     # Generic accessors
@@ -33,23 +35,28 @@ class UserCacheManager:
         return f"user:{user_id}:{namespace}"
 
     def get(self, user_id: str, namespace: str) -> Optional[Any]:
-        return self._store.get(self._key(user_id, namespace))
+        with self._lock:
+            return self._store.get(self._key(user_id, namespace))
 
     def set(self, user_id: str, namespace: str, value: Any) -> None:
-        self._store[self._key(user_id, namespace)] = value
+        with self._lock:
+            self._store[self._key(user_id, namespace)] = value
 
     def has(self, user_id: str, namespace: str) -> bool:
-        return self._key(user_id, namespace) in self._store
+        with self._lock:
+            return self._key(user_id, namespace) in self._store
 
     def clear_user(self, user_id: str) -> None:
         """Remove all cached data for a user."""
-        keys_to_remove = [k for k in self._store if k.startswith(f"user:{user_id}:")]
-        for k in keys_to_remove:
-            del self._store[k]
+        with self._lock:
+            keys_to_remove = [k for k in self._store if k.startswith(f"user:{user_id}:")]
+            for k in keys_to_remove:
+                del self._store[k]
 
     def clear_all(self) -> None:
         """Clear the entire cache."""
-        self._store.clear()
+        with self._lock:
+            self._store.clear()
 
     # ──────────────────────────────────────────────
     # Profile cache
@@ -142,9 +149,11 @@ class UserCacheManager:
 
     def append_query(self, user_id: str, prompt: str, operation: str, result_summary: str) -> None:
         """Append a query interaction to the user's history (FIFO, max N)."""
-        if not self.has(user_id, "query_history"):
-            self.set(user_id, "query_history", deque(maxlen=self.MAX_QUERY_HISTORY))
-        self.get(user_id, "query_history").append((prompt, operation, result_summary))
+        key = self._key(user_id, "query_history")
+        with self._lock:
+            if key not in self._store:
+                self._store[key] = deque(maxlen=self.MAX_QUERY_HISTORY)
+            self._store[key].append((prompt, operation, result_summary))
 
     # ──────────────────────────────────────────────
     # Visualization state cache

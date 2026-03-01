@@ -1,7 +1,7 @@
 """LLM Client — Multi-provider HTTP client with retry, model fallback, and tool calling support.
 
 Supports:
-  1. Google Gemini (via OpenAI-compatible endpoint) — primary if GEMINI_API_KEY is set
+  1. Google Gemini (via native generateContent API) — primary if GEMINI_API_KEY is set
   2. OpenRouter (multi-model free tier) — fallback or standalone if only OPENROUTER_API_KEY is set
 """
 
@@ -18,15 +18,15 @@ logger = logging.getLogger(__name__)
 
 GEMINI_MODELS = [
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
 ]
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+# Native generateContent API — separate rate-limit pool, higher quotas than OpenAI-compat endpoint
+GEMINI_NATIVE_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 OPENROUTER_MODELS = [
     "meta-llama/llama-3.3-70b-instruct:free",
     "qwen/qwen3-4b:free",
     "mistralai/mistral-small-3.1-24b-instruct:free",
-    "nousresearch/hermes-3-llama-3.1-405b:free",
+    "google/gemini-2.0-flash-exp:free",
 ]
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -86,9 +86,8 @@ class LLMClient:
             self._providers.append({
                 "name": "Gemini",
                 "api_key": gemini_key,
-                "api_url": GEMINI_API_URL,
                 "models": list(GEMINI_MODELS),
-                "headers_extra": {},
+                "use_native": True,   # use native generateContent API
             })
 
         if openrouter_key:
@@ -146,30 +145,134 @@ class LLMClient:
             for model_name in models_to_try:
                 for attempt in range(MAX_RETRIES):
                     try:
-                        response = self._make_request(
-                            provider, model_name, messages, tools, temperature, max_tokens
-                        )
-                        return self._parse_response(response, model_name)
+                        if provider.get("use_native"):
+                            raw = self._make_native_gemini_request(
+                                provider, model_name, messages, tools, temperature, max_tokens
+                            )
+                            return self._parse_native_gemini_response(raw, model_name)
+                        else:
+                            raw = self._make_request(
+                                provider, model_name, messages, tools, temperature, max_tokens
+                            )
+                            return self._parse_response(raw, model_name)
                     except requests.HTTPError as e:
                         last_error = e
-                        # Smart 429 handling: parse wait time from response
+                        status = e.response.status_code if e.response is not None else None
+                        if status == 429:
+                            # Rate-limited — no point retrying same model, move to next
+                            logger.warning(f"Rate limit hit ({provider_name}/{model_name}). Skipping to next model...")
+                            break
                         wait = self._get_retry_wait(e, attempt)
-                        print(f"  ⚠ LLM call failed ({provider_name}/{model_name}, attempt={attempt+1}/{MAX_RETRIES}): {e}")
-                        print(f"    Retrying in {wait}s...")
+                        logger.warning(f"LLM call failed ({provider_name}/{model_name}, attempt={attempt+1}/{MAX_RETRIES}): {e}. Retrying in {wait}s...")
                         time.sleep(wait)
                     except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
                         last_error = e
                         wait = BACKOFF_BASE * (2 ** attempt)
-                        print(f"  ⚠ LLM call failed ({provider_name}/{model_name}, attempt={attempt+1}/{MAX_RETRIES}): {e}")
-                        print(f"    Retrying in {wait}s...")
+                        logger.warning(f"LLM call failed ({provider_name}/{model_name}, attempt={attempt+1}/{MAX_RETRIES}): {e}. Retrying in {wait}s...")
                         time.sleep(wait)
 
-                print(f"  ✗ {provider_name}/{model_name} exhausted all retries, trying next...")
+                logger.warning(f"{provider_name}/{model_name} exhausted, trying next...")
 
-            print(f"  ✗ Provider {provider_name} exhausted, trying next provider...")
+            logger.warning(f"Provider {provider_name} exhausted, trying next provider...")
 
         raise RuntimeError(
             f"All LLM providers and models exhausted after retries. Last error: {last_error}"
+        )
+
+    def _make_native_gemini_request(
+        self,
+        provider: Dict,
+        model: str,
+        messages: List[Dict],
+        tools: Optional[List[Dict]],
+        temperature: float,
+        max_tokens: int,
+    ) -> Dict:
+        """Make a request to the native Gemini generateContent API (same format as Postman curl)."""
+        url = GEMINI_NATIVE_URL.format(model=model)
+
+        # Separate system messages — Gemini native uses systemInstruction field
+        system_parts = []
+        contents = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "") or ""
+            if role == "system":
+                system_parts.append({"text": content})
+            elif role == "user":
+                contents.append({"role": "user", "parts": [{"text": content}]})
+            elif role == "assistant":
+                contents.append({"role": "model", "parts": [{"text": content}]})
+
+        payload: Dict[str, Any] = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_tokens,
+            },
+        }
+
+        if system_parts:
+            payload["systemInstruction"] = {"parts": system_parts}
+
+        # Convert OpenAI tool schema → Gemini functionDeclarations
+        if tools:
+            declarations = []
+            for tool in tools:
+                func = tool.get("function", {})
+                declarations.append({
+                    "name": func.get("name", ""),
+                    "description": func.get("description", ""),
+                    "parameters": func.get("parameters", {}),
+                })
+            payload["tools"] = [{"functionDeclarations": declarations}]
+
+        response = requests.post(
+            url,
+            params={"key": provider["api_key"]},  # key as query param, same as Postman
+            json=payload,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _parse_native_gemini_response(self, raw: Dict, model_name: str) -> LLMResponse:
+        """Parse a native Gemini generateContent API response."""
+        candidates = raw.get("candidates", [])
+        if not candidates:
+            return LLMResponse(model_used=model_name)
+
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text_parts = []
+        tool_calls = []
+        malformed_count = 0
+
+        for part in parts:
+            if "text" in part:
+                text_parts.append(part["text"])
+            elif "functionCall" in part:
+                fc = part["functionCall"]
+                name = fc.get("name", "")
+                args = fc.get("args", {})
+
+                # args from native API are already a dict; handle string edge case
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        logger.warning(f"Malformed functionCall args for '{name}': {args!r}. Skipping.")
+                        malformed_count += 1
+                        continue
+
+                tool_calls.append({"id": f"call_{name}", "name": name, "arguments": args})
+
+        return LLMResponse(
+            text="\n".join(text_parts),
+            tool_calls=tool_calls,
+            model_used=model_name,
+            usage=raw.get("usageMetadata", {}),
+            raw=raw,
+            malformed_tool_call_count=malformed_count,
         )
 
     def _make_request(
