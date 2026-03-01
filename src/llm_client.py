@@ -1,4 +1,9 @@
-"""OpenRouter LLM Client — HTTP client with retry, model fallback, and tool calling support."""
+"""LLM Client — Multi-provider HTTP client with retry, model fallback, and tool calling support.
+
+Supports:
+  1. Google Gemini (via OpenAI-compatible endpoint) — primary if GEMINI_API_KEY is set
+  2. OpenRouter (multi-model free tier) — fallback or standalone if only OPENROUTER_API_KEY is set
+"""
 
 import os
 import json
@@ -9,20 +14,25 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# ── Provider configurations ──────────────────────────────────────
 
-# Free models on OpenRouter that support tool/function calling
-# (ordered by preference)
-FREE_MODELS = [
-    "meta-llama/llama-4-maverick:free",
-    "google/gemini-2.0-flash-exp:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
+GEMINI_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
 ]
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
+OPENROUTER_MODELS = [
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "qwen/qwen3-4b:free",
+    "mistralai/mistral-small-3.1-24b-instruct:free",
+    "nousresearch/hermes-3-llama-3.1-405b:free",
+]
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # Retry config
 MAX_RETRIES = 3
-BACKOFF_BASE = 1  # seconds
+BACKOFF_BASE = 4  # seconds (gives rate-limited free tiers time to recover)
 
 
 class LLMResponse:
@@ -54,25 +64,53 @@ class LLMResponse:
 
 
 class LLMClient:
-    """Client for the OpenRouter chat completions API.
-    
+    """Multi-provider LLM client (Gemini primary, OpenRouter fallback).
+
     Features:
         - Automatic retry with exponential backoff
-        - Model fallback chain (tries multiple free models)
+        - Provider + model fallback chain
         - Tool/function calling support
         - Configurable timeout
     """
 
     def __init__(self, api_key: Optional[str] = None, timeout: int = 30):
-        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY", "")
         self.timeout = timeout
-        self.models = list(FREE_MODELS)
 
-        if not self.api_key:
+        # Build provider chain: Gemini first (if available), then OpenRouter
+        self._providers: List[Dict] = []
+
+        gemini_key = os.getenv("GEMINI_API_KEY", "")
+        openrouter_key = api_key or os.getenv("OPENROUTER_API_KEY", "")
+
+        if gemini_key:
+            self._providers.append({
+                "name": "Gemini",
+                "api_key": gemini_key,
+                "api_url": GEMINI_API_URL,
+                "models": list(GEMINI_MODELS),
+                "headers_extra": {},
+            })
+
+        if openrouter_key:
+            self._providers.append({
+                "name": "OpenRouter",
+                "api_key": openrouter_key,
+                "api_url": OPENROUTER_API_URL,
+                "models": list(OPENROUTER_MODELS),
+                "headers_extra": {
+                    "HTTP-Referer": "https://github.com/vola-pro-pipeline",
+                    "X-Title": "Transaction RAG Pipeline",
+                },
+            })
+
+        if not self._providers:
             raise ValueError(
-                "OPENROUTER_API_KEY not set. Provide it as an argument or set the "
-                "OPENROUTER_API_KEY environment variable."
+                "No LLM API key found. Set GEMINI_API_KEY or OPENROUTER_API_KEY "
+                "in your .env file."
             )
+
+        provider_names = [p["name"] for p in self._providers]
+        logger.info(f"LLM providers configured: {provider_names}")
 
     def chat(
         self,
@@ -83,59 +121,71 @@ class LLMClient:
         max_tokens: int = 2000,
     ) -> LLMResponse:
         """Send a chat completion request with optional tool schemas.
-        
-        Tries each model in the fallback chain on failure.
-        
+
+        Tries each provider + model in the fallback chain on failure.
+
         Args:
             messages: Chat messages in OpenAI format.
             tools: Optional tool schemas for function calling.
             model: Override model (skips fallback chain).
             temperature: Sampling temperature.
             max_tokens: Maximum response tokens.
-            
+
         Returns:
             LLMResponse with text and/or tool calls.
-            
+
         Raises:
-            RuntimeError: If all models and retries are exhausted.
+            RuntimeError: If all providers, models, and retries are exhausted.
         """
-        models_to_try = [model] if model else self.models
         last_error = None
 
-        for model_name in models_to_try:
-            for attempt in range(MAX_RETRIES):
-                try:
-                    response = self._make_request(
-                        model_name, messages, tools, temperature, max_tokens
-                    )
-                    return self._parse_response(response, model_name)
-                except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
-                    last_error = e
-                    wait = BACKOFF_BASE * (2 ** attempt)
-                    print(f"  ⚠ LLM call failed (model={model_name}, attempt={attempt+1}/{MAX_RETRIES}): {e}")
-                    print(f"    Retrying in {wait}s...")
-                    time.sleep(wait)
+        for provider in self._providers:
+            models_to_try = [model] if model else provider["models"]
+            provider_name = provider["name"]
 
-            print(f"  ✗ Model {model_name} exhausted all retries, trying next model...")
+            for model_name in models_to_try:
+                for attempt in range(MAX_RETRIES):
+                    try:
+                        response = self._make_request(
+                            provider, model_name, messages, tools, temperature, max_tokens
+                        )
+                        return self._parse_response(response, model_name)
+                    except requests.HTTPError as e:
+                        last_error = e
+                        # Smart 429 handling: parse wait time from response
+                        wait = self._get_retry_wait(e, attempt)
+                        print(f"  ⚠ LLM call failed ({provider_name}/{model_name}, attempt={attempt+1}/{MAX_RETRIES}): {e}")
+                        print(f"    Retrying in {wait}s...")
+                        time.sleep(wait)
+                    except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
+                        last_error = e
+                        wait = BACKOFF_BASE * (2 ** attempt)
+                        print(f"  ⚠ LLM call failed ({provider_name}/{model_name}, attempt={attempt+1}/{MAX_RETRIES}): {e}")
+                        print(f"    Retrying in {wait}s...")
+                        time.sleep(wait)
+
+                print(f"  ✗ {provider_name}/{model_name} exhausted all retries, trying next...")
+
+            print(f"  ✗ Provider {provider_name} exhausted, trying next provider...")
 
         raise RuntimeError(
-            f"All LLM models exhausted after retries. Last error: {last_error}"
+            f"All LLM providers and models exhausted after retries. Last error: {last_error}"
         )
 
     def _make_request(
         self,
+        provider: Dict,
         model: str,
         messages: List[Dict],
         tools: Optional[List[Dict]],
         temperature: float,
         max_tokens: int,
     ) -> Dict:
-        """Make a single HTTP request to OpenRouter."""
+        """Make a single HTTP request to the provider's API."""
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {provider['api_key']}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/vola-pro-pipeline",
-            "X-Title": "Transaction RAG Pipeline",
+            **provider["headers_extra"],
         }
 
         payload = {
@@ -150,7 +200,7 @@ class LLMClient:
             payload["tool_choice"] = "auto"
 
         response = requests.post(
-            OPENROUTER_API_URL,
+            provider["api_url"],
             headers=headers,
             json=payload,
             timeout=self.timeout,
@@ -159,14 +209,36 @@ class LLMClient:
         response.raise_for_status()
         return response.json()
 
+    @staticmethod
+    def _get_retry_wait(error: requests.HTTPError, attempt: int) -> int:
+        """Extract wait time from 429 response, or use exponential backoff."""
+        import re
+        if hasattr(error, 'response') and error.response is not None:
+            status = error.response.status_code
+            if status == 429:
+                # Try to parse "retry in X.Xs" from Gemini responses
+                try:
+                    body = error.response.text
+                    match = re.search(r'retry in (\d+\.?\d*)', body, re.IGNORECASE)
+                    if match:
+                        return int(float(match.group(1))) + 2  # add buffer
+                except Exception:
+                    pass
+                # 429 without parseable wait — use generous fixed wait
+                return 30
+            elif status == 404:
+                return 1  # no point waiting long for 404
+        # Default exponential backoff
+        return BACKOFF_BASE * (2 ** attempt)
+
     def _parse_response(self, raw: Dict, model_name: str) -> LLMResponse:
-        """Parse the OpenRouter API response into an LLMResponse."""
+        """Parse the API response into an LLMResponse."""
         choice = raw.get("choices", [{}])[0]
         message = choice.get("message", {})
 
         text = message.get("content", "") or ""
 
-        # Parse tool calls (Gap 2 — flag and skip malformed JSON instead of silent {})
+        # Parse tool calls (flag and skip malformed JSON instead of silent {})
         tool_calls = []
         malformed_count = 0
         raw_tool_calls = message.get("tool_calls", [])

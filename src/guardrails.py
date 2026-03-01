@@ -343,7 +343,7 @@ class OutputGuardrails:
         return GuardrailResult(passed=True)
 
     @classmethod
-    def run_all(cls, response_text: str, actual_data: Dict, data_row_count: int) -> GuardrailResult:
+    def run_all(cls, response_text: str, actual_data: Dict, data_row_count: int, skip_hallucination: bool = False) -> GuardrailResult:
         """Run all output guardrails. Aggregates flags."""
         all_flags = []
         messages = []
@@ -354,11 +354,12 @@ class OutputGuardrails:
             return result  # hard block
         all_flags.extend(result.flags)
 
-        # 2. Hallucination
-        result = cls.check_hallucination(response_text, actual_data)
-        all_flags.extend(result.flags)
-        if result.message:
-            messages.append(result.message)
+        # 2. Hallucination (skip for fallback responses — numbers are self-computed)
+        if not skip_hallucination:
+            result = cls.check_hallucination(response_text, actual_data)
+            all_flags.extend(result.flags)
+            if result.message:
+                messages.append(result.message)
 
         # 3. Confidence
         result = cls.check_confidence(response_text, data_row_count)

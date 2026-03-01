@@ -32,7 +32,8 @@ class TransactionRAGPipeline:
         Args:
             df: DataFrame with columns: user_id, user_name, transaction_date,
                 transaction_amount, transaction_category_detail, merchant_name.
-            api_key: Optional OpenRouter API key (falls back to env var).
+            api_key: Optional API key for OpenRouter (falls back to env var).
+                     Set GEMINI_API_KEY in .env for Gemini (preferred provider).
         """
         self.df = df.copy()
         self.df["transaction_date"] = pd.to_datetime(self.df["transaction_date"])
@@ -132,9 +133,11 @@ class TransactionRAGPipeline:
         data_summary = self._compute_data_summary(user_df, prompt)
 
         # Check circuit breaker
+        used_fallback = False
         if self.operational.is_circuit_open():
             guardrail_flags.append("CIRCUIT_BREAKER_OPEN")
             llm_text = self._fallback_response(user_df, profile, prompt)
+            used_fallback = True
         else:
             try:
                 llm_client = self._get_llm_client()
@@ -190,12 +193,14 @@ class TransactionRAGPipeline:
                 if tripped:
                     guardrail_flags.append("CIRCUIT_BREAKER_TRIPPED")
                 llm_text = self._fallback_response(user_df, profile, prompt)
+                used_fallback = True
 
         # ─── Stage 4: Response Composition ───
 
-        # Output guardrails
+        # Output guardrails (skip hallucination check on fallback — numbers are self-computed)
         output_result = OutputGuardrails.run_all(
-            llm_text, data_summary, len(user_df)
+            llm_text, data_summary, len(user_df),
+            skip_hallucination=used_fallback,
         )
         guardrail_flags.extend(output_result.flags)
 
