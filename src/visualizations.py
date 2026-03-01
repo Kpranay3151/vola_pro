@@ -183,26 +183,38 @@ def plot_category_breakdown(
 
     total_spend = cat_totals.sum()
 
-    fig, ax = plt.subplots(figsize=(8, 8))
+    fig, ax = plt.subplots(figsize=(10, 8))
     fig.patch.set_facecolor(DARK_BG)
 
     colors = COLORS_PALETTE[:len(cat_totals)]
-    wedges, texts, autotexts = ax.pie(
+    percentages = cat_totals.values / total_spend * 100
+
+    # Draw donut without inline labels (avoids overlap on small slices)
+    wedges, _ = ax.pie(
         cat_totals.values,
-        labels=cat_totals.index,
-        autopct=lambda p: f"{p:.1f}%\n{format_currency(total_spend * p / 100)}",
+        labels=[""] * len(cat_totals),  # no inline labels
         colors=colors,
         startangle=90,
-        pctdistance=0.78,
         wedgeprops=dict(width=0.4, edgecolor=DARK_BG, linewidth=2),
     )
 
-    for text in texts:
-        text.set_color(TEXT_COLOR)
-        text.set_fontsize(10)
-    for autotext in autotexts:
-        autotext.set_color(TEXT_COLOR)
-        autotext.set_fontsize(8)
+    # Only annotate percentage on slices large enough (>= 5%)
+    for i, (wedge, pct, val) in enumerate(zip(wedges, percentages, cat_totals.values)):
+        if pct >= 5:
+            ang = (wedge.theta2 + wedge.theta1) / 2
+            x = 0.78 * np.cos(np.radians(ang))
+            y = 0.78 * np.sin(np.radians(ang))
+            ax.text(x, y, f"{pct:.1f}%\n{format_currency(val)}",
+                    ha="center", va="center", fontsize=8, color=TEXT_COLOR)
+
+    # Legend with category name, percentage, and amount
+    legend_labels = [
+        f"{name}  ({pct:.1f}%, {format_currency(val)})"
+        for name, pct, val in zip(cat_totals.index, percentages, cat_totals.values)
+    ]
+    ax.legend(wedges, legend_labels, loc="center left", bbox_to_anchor=(1.0, 0.5),
+              fontsize=9, facecolor=CARD_BG, edgecolor=GRID_COLOR,
+              labelcolor=TEXT_COLOR, framealpha=0.9)
 
     # Center text
     ax.text(0, 0, f"Total\n{format_currency(total_spend)}",

@@ -50,7 +50,7 @@ FINANCIAL_KEYWORDS = [
 
 # Off-topic indicators
 OFF_TOPIC_PATTERNS = [
-    r"(write|compose|create)\s+(a\s+)?(poem|song|story|essay|code|script)",
+    r"(write|compose|create)\s+(\w+\s+)*(poem|song|story|essay|code|script)",
     r"(what|who)\s+is\s+the\s+(president|capital|population)",
     r"(translate|convert)\s+.+\s+(to|into)\s+(french|spanish|german|japanese)",
     r"(tell|say)\s+(me\s+)?a\s+joke",
